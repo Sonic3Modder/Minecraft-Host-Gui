@@ -2,6 +2,7 @@ import os
 import json
 import threading
 import customtkinter
+import CTkScrollableDropdown
 import CTkMessagebox
 from tkinter import filedialog
 import shutil
@@ -11,7 +12,6 @@ from libraries.directory_handler import change_server_directory
 from libraries import mods_api
 import pystray
 from libraries.systemtray import SystemTray
-
 
 
 class MyTabView(customtkinter.CTkTabview):
@@ -105,6 +105,11 @@ class MyTabView(customtkinter.CTkTabview):
         )
         self.loader_menu.set("-")
         self.loader_menu.grid(row=6, column=0, padx=10, pady=(0, 10), sticky="we")
+        if _HAS_SCROLLABLE_DROPDOWN:
+            try:
+                self.loader_menu_dd = CTkScrollableDropdown(self.loader_menu, values=self.loader_menu.cget("values"))
+            except Exception:
+                self.loader_menu_dd = None
 
         # Sort selector
         self.sort_label = customtkinter.CTkLabel(self.sidebar, text="Sort by")
@@ -112,6 +117,11 @@ class MyTabView(customtkinter.CTkTabview):
         self.sort_menu = customtkinter.CTkOptionMenu(self.sidebar, values=["Relevance", "Downloads", "Updated"])
         self.sort_menu.set("Relevance")
         self.sort_menu.grid(row=8, column=0, padx=10, pady=(0, 10), sticky="we")
+        if _HAS_SCROLLABLE_DROPDOWN:
+            try:
+                self.sort_menu_dd = CTkScrollableDropdown(self.sort_menu, values=self.sort_menu.cget("values"))
+            except Exception:
+                self.sort_menu_dd = None
 
         # Results list
         self.results_frame = customtkinter.CTkScrollableFrame(self.sidebar, width=260, height=320)
@@ -136,10 +146,18 @@ class MyTabView(customtkinter.CTkTabview):
         self.version_select = customtkinter.CTkOptionMenu(self.bottom_bar, values=["-"], width=300)
         self.version_select.set("-")
         self.version_select.grid(row=0, column=0, padx=(0, 10), pady=10, sticky="w")
+        # Upgrade to scrollable dropdown if available
+        if _HAS_SCROLLABLE_DROPDOWN:
+            try:
+                self.version_select_dd = CTkScrollableDropdown(self.version_select, values=["-"])
+            except Exception:
+                self.version_select_dd = None
         self.add_btn = customtkinter.CTkButton(self.bottom_bar, text="Add to selected", command=master.on_install_selected, width=180)
         self.add_btn.grid(row=0, column=1, padx=0, pady=10, sticky="e")
 
         # Trigger initial search so the list is populated
+        # Debounced initial search
+        master._search_job = None
         master.after(200, master.on_search_projects)
 
 
@@ -173,7 +191,9 @@ class App(customtkinter.CTk):
             "selected_provider": "Modrinth",
             "selected_type": "mods",
             "curseforge_key": None,
-            "version_map": {}
+            "version_map": {},
+            "project_cache": {},
+            "icon_cache": {}
         }
 
         # Load config for CurseForge key
@@ -344,11 +364,21 @@ class App(customtkinter.CTk):
 
     # Browse/Install handlers
     def on_search_projects(self):
+        # Debounce rapid calls
+        try:
+            if hasattr(self, "_search_job") and self._search_job is not None:
+                self.after_cancel(self._search_job)
+        except Exception:
+            pass
+        self._search_job = self.after(200, self._do_search_projects)
+
+    def _do_search_projects(self):
         provider = self.tab_view.provider_var.get()
         sel_type = self.tab_view.type_segment.get()
         query = self.tab_view.search_entry.get().strip()
         mc_version = self.tab_view.version_entry.get().strip()
         sort = self.tab_view.sort_menu.get()
+        loader = self.tab_view.loader_menu.get().strip()
 
         # Clear previous
         for btn in getattr(self.tab_view, 'results_buttons', []):
@@ -368,7 +398,11 @@ class App(customtkinter.CTk):
                         index = "downloads"
                     elif sort == "Updated":
                         index = "updated"
-                    hits = mods_api.modrinth_search_projects(query, project_type, index=index)
+                    loaders = None
+                    if loader and loader != "-":
+                        loaders = [loader]
+                    gversions = [mc_version] if mc_version else None
+                    hits = mods_api.modrinth_search_projects(query, project_type, index=index, loaders=loaders, game_versions=gversions)
                     items = [(h.get("project_id"), h.get("title")) for h in hits]
                     payload = [(pid, name) for pid, name in items if pid and name]
                 else:
@@ -398,7 +432,11 @@ class App(customtkinter.CTk):
                 btn.grid(row=idx, column=0, padx=5, pady=3, sticky="w")
                 self.tab_view.results_buttons.append(btn)
 
-        threading.Thread(target=lambda: done(run()), daemon=True).start()
+        def worker():
+            result = run()
+            self.after(0, lambda: done(result))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_select_project(self, project_id, name):
         self._browse_state["selected_project"] = (project_id, name)
@@ -411,8 +449,12 @@ class App(customtkinter.CTk):
         def run():
             try:
                 if provider == "Modrinth":
-                    # Fetch details
-                    details = mods_api.modrinth_get_project(project_id)
+                    # Fetch details (cache per project)
+                    details = self._browse_state["project_cache"].get((provider, project_id)) if isinstance(self._browse_state.get("project_cache"), dict) else None
+                    if not details:
+                        details = mods_api.modrinth_get_project(project_id)
+                        if isinstance(self._browse_state.get("project_cache"), dict):
+                            self._browse_state["project_cache"][(provider, project_id)] = details
                     icon_url = details.get("icon_url")
                     desc = details.get("description") or details.get("slug") or name
                     # Build loader filter if provided
@@ -442,10 +484,26 @@ class App(customtkinter.CTk):
                                 label = f"{vname}"
                                 mapping[label] = url
                                 options.append(label)
+                    # Fallback: if filtering returned nothing, retry without filters
+                    if not options and (loaders or versions):
+                        vers = mods_api.modrinth_get_versions(project_id)
+                        for v in vers:
+                            vname = v.get("version_number") or v.get("name") or "unknown"
+                            files = v.get("files") or []
+                            if files:
+                                primary = files[0]
+                                url = primary.get("url") or primary.get("filename")
+                                if url:
+                                    mapping[vname] = url
+                                    options.append(vname)
                     return ("ok", (options, mapping, icon_url, desc))
                 else:
                     key = self._browse_state.get("curseforge_key")
-                    proj = mods_api.curseforge_get_project(int(project_id), key)
+                    proj = self._browse_state["project_cache"].get((provider, int(project_id))) if isinstance(self._browse_state.get("project_cache"), dict) else None
+                    if not proj:
+                        proj = mods_api.curseforge_get_project(int(project_id), key)
+                        if isinstance(self._browse_state.get("project_cache"), dict):
+                            self._browse_state["project_cache"][(provider, int(project_id))] = proj
                     logo = (proj.get("logo") or {}).get("url")
                     summary = proj.get("summary") or proj.get("name") or name
                     files = mods_api.curseforge_get_files(int(project_id), key)
@@ -467,6 +525,16 @@ class App(customtkinter.CTk):
                         if display and url:
                             mapping[display] = url
                             options.append(display)
+                    # Fallback if filters removed all options
+                    if not options and (mc_version or (loader and loader != "-")):
+                        mapping = {}
+                        options = []
+                        for f in files:
+                            display = f.get("displayName") or f.get("fileName")
+                            url = f.get("downloadUrl")
+                            if display and url:
+                                mapping[display] = url
+                                options.append(display)
                     return ("ok", (options, mapping, logo, summary))
             except Exception as e:
                 return ("error", str(e))
@@ -482,6 +550,11 @@ class App(customtkinter.CTk):
             self._browse_state["version_map"] = mapping
             self.tab_view.version_select.configure(values=options)
             self.tab_view.version_select.set(options[0])
+            if _HAS_SCROLLABLE_DROPDOWN and getattr(self.tab_view, 'version_select_dd', None) is not None:
+                try:
+                    self.tab_view.version_select_dd.configure(values=options)
+                except Exception:
+                    pass
             # Update description
             try:
                 self.tab_view.preview_desc.configure(state="normal")
@@ -494,17 +567,26 @@ class App(customtkinter.CTk):
             try:
                 if icon_url:
                     from PIL import Image, ImageTk
-                    data = mods_api.fetch_bytes(icon_url)
-                    import io
-                    img = Image.open(io.BytesIO(data)).resize((64, 64))
-                    self._browse_state["_icon_imgtk"] = ImageTk.PhotoImage(img)
-                    self.tab_view.preview_icon.configure(image=self._browse_state["_icon_imgtk"])
+                    cache_key = icon_url
+                    imgtk = self._browse_state["icon_cache"].get(cache_key) if isinstance(self._browse_state.get("icon_cache"), dict) else None
+                    if not imgtk:
+                        data = mods_api.fetch_bytes(icon_url)
+                        import io
+                        img = Image.open(io.BytesIO(data)).resize((64, 64))
+                        imgtk = ImageTk.PhotoImage(img)
+                        if isinstance(self._browse_state.get("icon_cache"), dict):
+                            self._browse_state["icon_cache"][cache_key] = imgtk
+                    self.tab_view.preview_icon.configure(image=imgtk)
                 else:
                     self.tab_view.preview_icon.configure(image=None, text="")
             except Exception:
                 self.tab_view.preview_icon.configure(image=None, text="")
 
-        threading.Thread(target=lambda: done(run()), daemon=True).start()
+        def worker():
+            result = run()
+            self.after(0, lambda: done(result))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_install_selected(self):
         if not self.folder_path:
@@ -538,7 +620,11 @@ class App(customtkinter.CTk):
             else:
                 CTkMessagebox.CTkMessagebox(title="Install Error", message=data, icon="error")
 
-        threading.Thread(target=lambda: done(run()), daemon=True).start()
+        def worker():
+            result = run()
+            self.after(0, lambda: done(result))
+
+        threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
     app = App()
